@@ -1,0 +1,67 @@
+site_name: NCronJob
+site_url: https://docs.ncronjob.dev/
+site_description: A simple and powerful job scheduler.
+docs_dir: docs
+repo_name: NCronJob-Dev/NCronJob
+repo_url: https://github.com/NCronJob-Dev/NCronJob
+edit_uri: edit/main/docs/
+theme:
+  name: readthedocs
+  hightlightjs: true
+  search: true
+  logo: logo_small.png
+  features:
+    - navigation.instant
+    - content.action.edit
+    - content.code.copy
+markdown_extensions:
+  - smarty
+  - sane_lists
+  - fenced_code
+  - meta
+  - admonition
+  - attr_list
+  - codehilite
+  - footnotes
+  - toc:
+      permalink: true
+nav:
+  - NCronJob: index.md
+  - Overview:
+    - Getting Started: getting-started.md
+    - Documentation Map: documentation-map.md
+    - Agent & Automation Guide: agent-guide.md
+    - Compact Markdown Reference: llms-full.md
+  - Features:
+    - Define and Schedule Jobs: features/define-and-schedule-jobs.md
+    - Passing Parameters: features/parameters.md
+    - Conditional Job Scheduling: features/conditional-job-scheduling.md
+    - Notifications: features/notifications.md
+    - Registering multiple CRON expressions: features/multiple-cron-expressions.md
+    - Triggering instant jobs: features/instant-jobs.md
+    - Concurrency control: features/concurrency-control.md
+    - Job timeouts and run expiry: features/timeouts-and-expiry.md
+    - Retry support: features/retry-support.md
+    - Minimal API: features/minimal-api.md
+    - Startup Jobs: features/startup-jobs.md
+    - Model dependencies: features/model-dependencies.md
+    - Exception handler: features/exception-handler.md
+  - Migration:
+    - v4 Migration Guide: migration/v4.md
+    - v3 Migration Guide: migration/v3.md
+    - v2 Migration Guide: migration/v2.md
+  - Advanced:
+    - Logging and log scopes: advanced/log-level.md
+    - Global Concurrency: advanced/global-concurrency.md
+    - Dynamic Job Control: advanced/dynamic-job-control.md
+    - Observing progress of jobs: advanced/observing-job-progress.md
+    - Known gotchas: advanced/known-gotchas.md
+
+extra:
+  generator: false
+  social:
+    - icon: fontawesome/brands/github
+      link: https://github.com/NCronJob-Dev/NCronJob
+
+
+copyright: ©2024-Present <a href="https://github.com/NCronJob-Dev">NCronJob-Dev</a>.

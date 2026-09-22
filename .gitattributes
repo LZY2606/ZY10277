@@ -1,0 +1,2 @@
+* text=auto
+.devcontainer/*.sh text eol=lf

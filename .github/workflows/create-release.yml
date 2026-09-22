@@ -1,0 +1,96 @@
+name: Create new Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      versionIncrement:
+        description: 'The new version. For example: 1.1.0'
+        required: true
+        default: ''
+      prerelease:
+        description: 'Is this a pre-release?'
+        type: boolean
+        required: false
+        default: false
+
+env:
+    DOTNET_SKIP_FIRST_TIME_EXPERIENCE: 1
+    DOTNET_NOLOGO: true
+    DOTNET_SYSTEM_CONSOLE_ALLOW_ANSI_COLOR_REDIRECTION: 1
+    TERM: xterm
+
+jobs:
+  release:
+    name: Publish new release
+    runs-on: ubuntu-latest
+    steps:
+    - name: Determine Version
+      id: version
+      run: |
+        if [ "${{ github.event.inputs.prerelease }}" = "true" ]; then
+          echo "version=${{ github.event.inputs.versionIncrement }}-preview" >> $GITHUB_OUTPUT
+        else
+          echo "version=${{ github.event.inputs.versionIncrement }}" >> $GITHUB_OUTPUT
+        fi
+
+    - name: Checkout repository
+      uses: actions/checkout@v7
+      with:
+        token: ${{ secrets.PAT }}
+        persist-credentials: true
+        fetch-depth: 0
+
+    - name: Get changelog entries
+      id: changelog
+      uses: mindsers/changelog-reader-action@v2
+      with:
+        version: Unreleased
+        path: ./CHANGELOG.md
+
+    - name: Setup dotnet
+      uses: actions/setup-dotnet@v6
+      with:
+        dotnet-version: |
+          8.0.x
+          9.0.x
+          10.0.x
+
+    - name: Update CHANGELOG file
+      if: github.event.inputs.prerelease == 'false'
+      uses: thomaseizinger/keep-a-changelog-new-release@3.1.0
+      with:
+        version: v${{ github.event.inputs.versionIncrement }}
+
+    - name: Set git config
+      if: github.event.inputs.prerelease == 'false'
+      run: |
+        git config --local user.email "ncronjob-dev@action.com"
+        git config --local user.name "ncronjob-dev Bot"
+
+    - name: Commit changes and push changes
+      if: github.event.inputs.prerelease == 'false'
+      run: |
+        git add CHANGELOG.md
+        git commit -m "Update Changelog.md for ${{github.event.inputs.versionIncrement}} release"
+        git push origin main
+
+    - name: Create release on GitHub
+      if: github.event.inputs.prerelease == 'false'
+      uses: thomaseizinger/create-release@2.0.0
+      env:
+        GITHUB_TOKEN: ${{ secrets.PAT }}
+      with:
+        tag_name: v${{ github.event.inputs.versionIncrement }}
+        target_commitish: ${{ env.RELEASE_COMMIT_HASH }}
+        name: v${{ github.event.inputs.versionIncrement }}
+        body: ${{ steps.changelog.outputs.changes }}
+        draft: false
+
+    - name: Create release package
+      run: |
+          dotnet pack -c RELEASE src/NCronJob/NCronJob.csproj -p:PackageVersion=${{ steps.version.outputs.version }} --property:PackageOutputPath=${GITHUB_WORKSPACE}/packages /p:ContinuousIntegrationBuild=true --nologo --include-symbols -p:SymbolPackageFormat=snupkg
+
+    - name: Upload to nuget
+      run: |
+        dotnet nuget push ${GITHUB_WORKSPACE}/packages/*.nupkg -k ${{ secrets.NUGET_API_KEY }} -s https://api.nuget.org/v3/index.json --skip-duplicate
+        dotnet nuget push ${GITHUB_WORKSPACE}/packages/*.snupkg -k ${{ secrets.NUGET_API_KEY }} -s https://api.nuget.org/v3/index.json --skip-duplicate
