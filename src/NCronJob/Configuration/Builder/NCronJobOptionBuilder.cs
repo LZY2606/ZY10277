@@ -36,6 +36,9 @@ public class NCronJobOptionBuilder : IJobStage, IRuntimeJobBuilder
         return this;
     }
 
+    IRuntimeJobBuilder IRuntimeJobBuilder.WithMaxDegreeOfParallelism(int maxDegreeOfParallelism)
+        => WithMaxDegreeOfParallelism(maxDegreeOfParallelism);
+
     /// <summary>
     /// Configures how long scheduled jobs may remain queued after their intended run time before expiring.
     /// </summary>

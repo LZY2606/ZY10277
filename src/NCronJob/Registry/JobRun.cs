@@ -63,6 +63,14 @@ internal class JobRun
 
     internal JobPriority Priority { get; set; } = JobPriority.Normal;
 
+    /// <summary>
+    /// The generation of the queue this run was enqueued into, stamped by <see cref="JobQueueManager"/>
+    /// at enqueue time. A worker that leased this run can only complete it against the same generation:
+    /// a stale completion must neither release a slot of a newer generation nor reorder the next due
+    /// run of a rescheduled queue. <c>0</c> means the run was never enqueued (e.g. startup jobs).
+    /// </summary>
+    internal long Generation { get; set; }
+
     public Guid JobRunId { get; }
     public Guid? ParentJobRunId { get; }
     public JobDefinition JobDefinition { get; }

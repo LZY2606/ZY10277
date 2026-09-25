@@ -6,6 +6,15 @@ namespace NCronJob;
 public interface IRuntimeJobBuilder
 {
     /// <summary>
+    /// Sets the maximum degree of parallelism for the job execution, i.e. the maximum number of jobs
+    /// that are allowed to run in parallel. Raising the limit at runtime wakes up workers that are
+    /// waiting for capacity.
+    /// </summary>
+    /// <param name="maxDegreeOfParallelism">The maximum degree of parallelism.</param>
+    /// <returns>Returns a <see cref="IRuntimeJobBuilder"/> that allows further configuration.</returns>
+    IRuntimeJobBuilder WithMaxDegreeOfParallelism(int maxDegreeOfParallelism);
+
+    /// <summary>
     /// Adds a job to the service collection that gets executed based on the given cron expression.
     /// If a job with the same configuration is already registered, it will throw an exception.
     /// </summary>

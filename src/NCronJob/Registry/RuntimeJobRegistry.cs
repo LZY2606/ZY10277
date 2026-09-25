@@ -195,6 +195,14 @@ internal sealed class RuntimeJobRegistry : IRuntimeJobRegistry
                 }
 
                 activationGate.Activate();
+
+                // Raising the global concurrency limit at runtime (e.g. recovering from zero) must wake
+                // workers waiting for capacity; otherwise no slot release would ever occur to wake them.
+                if (concurrencySettings.MaxDegreeOfParallelism != previousMaxDegreeOfParallelism)
+                {
+                    jobWorker.SignalCapacityChanged();
+                }
+
                 exception = null;
                 return true;
             }

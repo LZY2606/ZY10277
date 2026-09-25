@@ -8,6 +8,7 @@ internal sealed class JobQueueManager : IDisposable
 {
     private readonly ConcurrentDictionary<string, JobQueue> jobQueues = new();
     private readonly Dictionary<string, TaskCompletionSource> queueSignals = [];
+    private long nextQueueGeneration;
 #if NET9_0_OR_GREATER
     private readonly Lock syncLock = new();
 #else
@@ -44,12 +45,13 @@ internal sealed class JobQueueManager : IDisposable
             var jobQueue = jobQueues.GetOrAdd(queueName, jt =>
             {
                 isCreating = true;
-                var queue = new JobQueue(jt);
+                var queue = new JobQueue(jt, ++nextQueueGeneration);
                 queue.CollectionChanged += CallCollectionChanged;
                 queueSignals[jt] = CreateSignal();
                 return queue;
             });
 
+            run.Generation = jobQueue.Generation;
             jobQueue.EnqueueForDirectExecution(run);
         }
 
@@ -57,6 +59,58 @@ internal sealed class JobQueueManager : IDisposable
         {
             onQueueCreated?.Invoke(queueName);
             QueueAdded?.Invoke(queueName);
+        }
+
+        return true;
+    }
+
+    /// <summary>
+    /// Atomically dequeues <paramref name="expectedHead"/> when it is still the head of the queue and
+    /// returns a lease binding the run to the queue's current generation. Returns <c>null</c> when the
+    /// queue was removed or the head changed (remove/reschedule interleaved with the lease).
+    /// </summary>
+    public JobQueueLease? TryLease(string queueName, JobRun expectedHead)
+    {
+        lock (syncLock)
+        {
+            ObjectDisposedException.ThrowIf(IsDisposed, this);
+
+            if (!jobQueues.TryGetValue(queueName, out var jobQueue) || !jobQueue.TryDequeueIf(expectedHead))
+            {
+                return null;
+            }
+
+            return new JobQueueLease(expectedHead, jobQueue.Generation);
+        }
+    }
+
+    /// <summary>
+    /// Enqueues the successor run of a completed cron lease, but only when the queue still exists and is
+    /// at the same generation the lease was taken from. A remove/reschedule in between yields a fresh
+    /// generation, so a stale completion can never reorder the next due run of a rescheduled queue.
+    /// Unlike <see cref="Enqueue"/>, this never recreates a removed queue.
+    /// </summary>
+    /// <returns><c>false</c> when the generation check or <paramref name="canEnqueue"/> rejected the run.</returns>
+    public bool TryEnqueueSuccessor(JobQueueLease lease, JobRun successor, Func<bool>? canEnqueue = null)
+    {
+        var queueName = successor.JobDefinition.JobFullName;
+
+        lock (syncLock)
+        {
+            ObjectDisposedException.ThrowIf(IsDisposed, this);
+
+            if (!jobQueues.TryGetValue(queueName, out var jobQueue) || jobQueue.Generation != lease.Generation)
+            {
+                return false;
+            }
+
+            if (canEnqueue is not null && !canEnqueue())
+            {
+                return false;
+            }
+
+            successor.Generation = jobQueue.Generation;
+            jobQueue.EnqueueForDirectExecution(successor);
         }
 
         return true;

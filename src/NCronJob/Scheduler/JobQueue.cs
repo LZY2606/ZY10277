@@ -7,9 +7,17 @@ internal sealed class JobQueue : ObservablePriorityQueue<JobRun>
 {
     public string Name { get; }
 
-    public JobQueue(string name) : base(new JobQueueTupleComparer())
+    /// <summary>
+    /// The generation of this queue instance, assigned by <see cref="JobQueueManager"/> from a monotonic
+    /// counter. Removing and re-adding a queue (remove/reschedule) always yields a fresh generation, so
+    /// leases taken from a previous instance can be distinguished from the current one.
+    /// </summary>
+    public long Generation { get; }
+
+    public JobQueue(string name, long generation) : base(new JobQueueTupleComparer())
     {
         Name = name;
+        Generation = generation;
     }
 
     /// <summary>

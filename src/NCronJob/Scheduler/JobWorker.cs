@@ -74,7 +74,10 @@ internal sealed partial class JobWorker
                     continue;
                 }
 
-                if (!jobQueue.TryDequeueIf(nextJob))
+                // The lease binds the run to the queue generation under the queue manager's lock, so a
+                // remove/reschedule interleaving with the dequeue is observed as a failed lease.
+                var lease = jobQueueManager.TryLease(queueName, nextJob);
+                if (lease is null)
                 {
                     ReleaseSlot(nextJob.JobDefinition);
                     continue;
@@ -83,15 +86,18 @@ internal sealed partial class JobWorker
                 if (!await nextJob.WaitForActivationAsync().ConfigureAwait(false))
                 {
                     nextJob.NotifyStateChange(JobStateType.Cancelled);
-                    ReleaseSlot(nextJob.JobDefinition);
+                    CompleteLease(lease, nextJob.JobDefinition);
                     continue;
                 }
 
-                _ = StartJobProcessingAsync(nextJob, cancellationToken);
+                _ = StartJobProcessingAsync(nextJob, lease, cancellationToken);
 
                 if (nextJob.TriggerType == TriggerType.Cron)
                 {
-                    ScheduleJob(nextJob.JobDefinition, priority.NextRunTime);
+                    // Test seam: allows tests to deterministically interleave remove/reschedule between
+                    // the lease and the scheduling of the cron successor. Never set in production.
+                    JobLeasedForTesting?.Invoke(nextJob);
+                    ScheduleSuccessor(lease, priority.NextRunTime);
                 }
             }
         }
@@ -103,6 +109,48 @@ internal sealed partial class JobWorker
         {
             LogJobQueueManagerDisposed();
         }
+    }
+
+    // Test seam: invoked on the worker thread after a cron lease was taken and before its successor is
+    // scheduled, allowing tests to deterministically interleave remove/reschedule with lease completion.
+    internal Action<JobRun>? JobLeasedForTesting { get; set; }
+
+    internal int TotalRunningJobCount
+    {
+        get
+        {
+            lock (slotLock)
+            {
+                return totalRunningJobCount;
+            }
+        }
+    }
+
+    internal int GetRunningJobCount(JobDefinition jobDefinition)
+    {
+        lock (slotLock)
+        {
+            runningJobCounts.TryGetValue(jobDefinition.JobFullName, out var currentCount);
+            return currentCount;
+        }
+    }
+
+    /// <summary>
+    /// Wakes all workers waiting for capacity. Required when the global concurrency limit is raised at
+    /// runtime (e.g. recovered from zero): without a signal, no slot release would ever occur to wake
+    /// the waiters, which would be a missed wake-up.
+    /// </summary>
+    internal void SignalCapacityChanged()
+    {
+        TaskCompletionSource signal;
+
+        lock (slotLock)
+        {
+            signal = capacitySignal;
+            capacitySignal = CreateSignal();
+        }
+
+        signal.TrySetResult();
     }
 
     /// <summary>
@@ -127,10 +175,10 @@ internal sealed partial class JobWorker
         }
 
         AcquireSlot(jobRun.JobDefinition);
-        await StartJobProcessingAsync(jobRun, cancellationToken).ConfigureAwait(false);
+        await StartJobProcessingAsync(jobRun, lease: null, cancellationToken).ConfigureAwait(false);
     }
 
-    private Task StartJobProcessingAsync(JobRun jobRun, CancellationToken cancellationToken)
+    private Task StartJobProcessingAsync(JobRun jobRun, JobQueueLease? lease, CancellationToken cancellationToken)
     {
         Task jobTask;
 
@@ -145,7 +193,7 @@ internal sealed partial class JobWorker
                 }
                 finally
                 {
-                    ReleaseSlot(jobRun.JobDefinition);
+                    CompleteLease(lease, jobRun.JobDefinition);
                 }
             }, CancellationToken.None);
         }
@@ -159,6 +207,18 @@ internal sealed partial class JobWorker
             TaskScheduler.Default);
 
         return jobTask;
+    }
+
+    /// <summary>
+    /// Completes the lease and releases the capacity slot acquired with it. A lease completes at most
+    /// once, so a stale completion can never release a slot that a newer generation lease is holding.
+    /// </summary>
+    private void CompleteLease(JobQueueLease? lease, JobDefinition jobDefinition)
+    {
+        if (lease is null || lease.TryComplete())
+        {
+            ReleaseSlot(jobDefinition);
+        }
     }
 
     private async Task WaitUntilOrChangeAsync(DateTimeOffset dueTime, Task queueChanged, CancellationToken cancellationToken)
@@ -255,6 +315,54 @@ internal sealed partial class JobWorker
             return null;
         }
 
+        var run = CreateNextRun(job, lastScheduledRunTime, activationGate);
+        if (run is null)
+        {
+            return null;
+        }
+
+        onRunCreated?.Invoke(run);
+        run.NotifyStateChange(JobStateType.Scheduled);
+
+        // Checked atomically with queue removal, so a job removed concurrently isn't brought back by a pending reschedule.
+        if (!jobQueueManager.Enqueue(
+                run,
+                () => registry.IsRootJob(job),
+                onQueueCreated))
+        {
+            run.NotifyStateChange(JobStateType.Cancelled);
+        }
+
+        return run;
+    }
+
+    /// <summary>
+    /// Schedules the next occurrence of a cron job whose lease just fired. The successor is only
+    /// enqueued when the queue is still at the lease's generation; a remove/reschedule in between
+    /// already computed a fresh next due run that a stale completion must not reorder.
+    /// </summary>
+    private void ScheduleSuccessor(JobQueueLease lease, DateTimeOffset lastScheduledRunTime)
+    {
+        var job = lease.Run.JobDefinition;
+        var run = CreateNextRun(job, lastScheduledRunTime, activationGate: null);
+        if (run is null)
+        {
+            return;
+        }
+
+        run.NotifyStateChange(JobStateType.Scheduled);
+
+        if (!jobQueueManager.TryEnqueueSuccessor(lease, run, () => job.IsEnabled && registry.IsRootJob(job)))
+        {
+            run.NotifyStateChange(JobStateType.Cancelled);
+        }
+    }
+
+    private JobRun? CreateNextRun(
+        JobDefinition job,
+        DateTimeOffset? lastScheduledRunTime,
+        JobRunActivationGate? activationGate)
+    {
         var utcNow = timeProvider.GetUtcNow();
 
         // When rescheduling after a job fires, the timer may have triggered slightly
@@ -272,26 +380,13 @@ internal sealed partial class JobWorker
         }
 
         LogNextJobRun(job.Name, nextRunTime.Value);
-        var run = JobRun.Create(
+        return JobRun.Create(
             timeProvider,
             observer.Report,
             job,
             nextRunTime.Value,
             concurrencySettings,
             activationGate);
-        onRunCreated?.Invoke(run);
-        run.NotifyStateChange(JobStateType.Scheduled);
-
-        // Checked atomically with queue removal, so a job removed concurrently isn't brought back by a pending reschedule.
-        if (!jobQueueManager.Enqueue(
-                run,
-                () => registry.IsRootJob(job),
-                onQueueCreated))
-        {
-            run.NotifyStateChange(JobStateType.Cancelled);
-        }
-
-        return run;
     }
 
     public void RemoveJobByName(string jobName)
