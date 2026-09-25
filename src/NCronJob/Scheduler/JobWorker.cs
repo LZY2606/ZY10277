@@ -12,7 +12,7 @@ internal sealed partial class JobWorker
     private readonly JobExecutionProgressObserver observer;
     private readonly ILogger<JobWorker> logger;
     private readonly ConcurrencySettings concurrencySettings;
-    private readonly Dictionary<string, int> runningJobCounts = [];
+    private readonly Dictionary<SlotKey, int> runningJobCounts = [];
     private readonly ConcurrentDictionary<Task, byte> runningJobs = new();
     private int totalRunningJobCount;
     private TaskCompletionSource capacitySignal = CreateSignal();
@@ -46,52 +46,55 @@ internal sealed partial class JobWorker
         {
             while (!cancellationToken.IsCancellationRequested)
             {
-                // The signal must be taken before resolving the queue: if the queue gets replaced in between,
-                // the removal completes this signal instead of the worker waiting on the new queue's signal while peeking the old queue.
-                var queueChanged = jobQueueManager.WaitForChangeAsync(queueName);
-
-                if (!jobQueueManager.TryGetQueue(queueName, out var jobQueue))
+                // The snapshot binds the queue, its generation and its change signal atomically:
+                // every transition after the snapshot completes the signal, so no wake-up can be missed.
+                var snapshot = jobQueueManager.GetQueueSnapshot(queueName);
+                if (snapshot is null)
                 {
                     break;
                 }
 
-                if (!jobQueue.TryPeek(out var nextJob, out var priority))
+                if (!snapshot.Queue.TryPeek(out var nextJob, out var priority))
                 {
-                    await queueChanged.WaitAsync(cancellationToken).ConfigureAwait(false);
+                    await snapshot.ChangeSignal.WaitAsync(cancellationToken).ConfigureAwait(false);
                     continue;
                 }
 
                 if (priority.NextRunTime > timeProvider.GetUtcNow())
                 {
-                    await WaitUntilOrChangeAsync(priority.NextRunTime, queueChanged, cancellationToken).ConfigureAwait(false);
+                    await WaitUntilOrChangeAsync(priority.NextRunTime, snapshot.ChangeSignal, cancellationToken).ConfigureAwait(false);
                     continue;
                 }
 
                 var capacityChanged = GetCapacitySignal();
-                if (!TryReserveSlot(nextJob.JobDefinition))
+                if (!TryReserveSlot(nextJob.JobDefinition, snapshot.Generation))
                 {
-                    await Task.WhenAny(queueChanged, capacityChanged).WaitAsync(cancellationToken).ConfigureAwait(false);
+                    await Task.WhenAny(snapshot.ChangeSignal, capacityChanged).WaitAsync(cancellationToken).ConfigureAwait(false);
                     continue;
                 }
 
-                if (!jobQueue.TryDequeueIf(nextJob))
+                // The lease is only granted when the queue is still at the snapshot's generation,
+                // so a concurrent remove/reschedule can never hand out an item of a newer generation.
+                if (!jobQueueManager.TryDequeue(snapshot, nextJob, out var lease))
                 {
-                    ReleaseSlot(nextJob.JobDefinition);
+                    ReleaseSlot(nextJob.JobDefinition, snapshot.Generation);
                     continue;
                 }
 
                 if (!await nextJob.WaitForActivationAsync().ConfigureAwait(false))
                 {
                     nextJob.NotifyStateChange(JobStateType.Cancelled);
-                    ReleaseSlot(nextJob.JobDefinition);
+                    ReleaseSlot(nextJob.JobDefinition, lease.Generation);
                     continue;
                 }
 
-                _ = StartJobProcessingAsync(nextJob, cancellationToken);
+                _ = StartJobProcessingAsync(nextJob, lease.Generation, cancellationToken);
 
                 if (nextJob.TriggerType == TriggerType.Cron)
                 {
-                    ScheduleJob(nextJob.JobDefinition, priority.NextRunTime);
+                    // Only the same generation may schedule the follow-up run: a stale lease must not
+                    // reorder the next due run of a newer (removed/rescheduled) generation.
+                    ScheduleJob(nextJob.JobDefinition, priority.NextRunTime, expectedGeneration: lease.Generation);
                 }
             }
         }
@@ -127,10 +130,10 @@ internal sealed partial class JobWorker
         }
 
         AcquireSlot(jobRun.JobDefinition);
-        await StartJobProcessingAsync(jobRun, cancellationToken).ConfigureAwait(false);
+        await StartJobProcessingAsync(jobRun, JobRun.UngeneratedGeneration, cancellationToken).ConfigureAwait(false);
     }
 
-    private Task StartJobProcessingAsync(JobRun jobRun, CancellationToken cancellationToken)
+    private Task StartJobProcessingAsync(JobRun jobRun, long generation, CancellationToken cancellationToken)
     {
         Task jobTask;
 
@@ -145,7 +148,7 @@ internal sealed partial class JobWorker
                 }
                 finally
                 {
-                    ReleaseSlot(jobRun.JobDefinition);
+                    ReleaseSlot(jobRun.JobDefinition, generation);
                 }
             }, CancellationToken.None);
         }
@@ -185,20 +188,25 @@ internal sealed partial class JobWorker
         cancellationToken.ThrowIfCancellationRequested();
     }
 
-    private bool TryReserveSlot(JobDefinition jobDefinition)
+    private bool TryReserveSlot(JobDefinition jobDefinition, long generation)
     {
         var maxAllowed = jobDefinition.ConcurrencyPolicy?.MaxDegreeOfParallelism ?? 1;
 
         lock (slotLock)
         {
-            runningJobCounts.TryGetValue(jobDefinition.JobFullName, out var currentCount);
+            // Per-job capacity is scoped to the queue generation: a re-added job starts from zero
+            // while runs of retired generations still count against the global limit until they finish.
+            var currentCount = GetRunningCountUnsafe(jobDefinition.JobFullName, generation)
+                + (generation == JobRun.UngeneratedGeneration
+                    ? 0
+                    : GetRunningCountUnsafe(jobDefinition.JobFullName, JobRun.UngeneratedGeneration));
 
             if (currentCount >= maxAllowed || totalRunningJobCount >= concurrencySettings.MaxDegreeOfParallelism)
             {
                 return false;
             }
 
-            IncrementSlotUnsafe(jobDefinition.JobFullName, currentCount);
+            IncrementSlotUnsafe(jobDefinition.JobFullName, generation);
             return true;
         }
     }
@@ -207,25 +215,39 @@ internal sealed partial class JobWorker
     {
         lock (slotLock)
         {
-            runningJobCounts.TryGetValue(jobDefinition.JobFullName, out var currentCount);
-            IncrementSlotUnsafe(jobDefinition.JobFullName, currentCount);
+            IncrementSlotUnsafe(jobDefinition.JobFullName, JobRun.UngeneratedGeneration);
         }
     }
 
-    private void IncrementSlotUnsafe(string jobFullName, int currentCount)
+    private void IncrementSlotUnsafe(string jobFullName, long generation)
     {
-        runningJobCounts[jobFullName] = currentCount + 1;
+        var key = new SlotKey(jobFullName, generation);
+        runningJobCounts[key] = GetRunningCountUnsafe(jobFullName, generation) + 1;
         totalRunningJobCount++;
     }
 
-    private void ReleaseSlot(JobDefinition jobDefinition)
+    private int GetRunningCountUnsafe(string jobFullName, long generation) =>
+        runningJobCounts.TryGetValue(new SlotKey(jobFullName, generation), out var count) ? count : 0;
+
+    private void ReleaseSlot(JobDefinition jobDefinition, long generation)
     {
         TaskCompletionSource signal;
 
         lock (slotLock)
         {
-            runningJobCounts.TryGetValue(jobDefinition.JobFullName, out var currentCount);
-            runningJobCounts[jobDefinition.JobFullName] = Math.Max(0, currentCount - 1);
+            // The release is paired with the lease's generation: a stale completion retires its own
+            // generation's bucket and can never free a slot of a newer generation.
+            var key = new SlotKey(jobDefinition.JobFullName, generation);
+            var remaining = Math.Max(0, GetRunningCountUnsafe(jobDefinition.JobFullName, generation) - 1);
+            if (remaining == 0)
+            {
+                runningJobCounts.Remove(key);
+            }
+            else
+            {
+                runningJobCounts[key] = remaining;
+            }
+
             totalRunningJobCount = Math.Max(0, totalRunningJobCount - 1);
 
             signal = capacitySignal;
@@ -235,11 +257,37 @@ internal sealed partial class JobWorker
         signal.TrySetResult();
     }
 
-    private Task GetCapacitySignal()
+    /// <summary>
+    /// A task that completes the next time any slot is released. Obtain it before inspecting the
+    /// slot counts so that no release can be missed.
+    /// </summary>
+    internal Task GetCapacitySignal()
     {
         lock (slotLock)
         {
             return capacitySignal.Task;
+        }
+    }
+
+    /// <summary>
+    /// The number of running jobs of the given queue generation. Diagnostic surface for tests.
+    /// </summary>
+    internal int GetRunningJobCount(string jobFullName, long generation)
+    {
+        lock (slotLock)
+        {
+            return GetRunningCountUnsafe(jobFullName, generation);
+        }
+    }
+
+    /// <summary>
+    /// The number of physically running jobs across all generations. Diagnostic surface for tests.
+    /// </summary>
+    internal int GetTotalRunningJobCount()
+    {
+        lock (slotLock)
+        {
+            return totalRunningJobCount;
         }
     }
 
@@ -248,7 +296,8 @@ internal sealed partial class JobWorker
         DateTimeOffset? lastScheduledRunTime = null,
         Action<JobRun>? onRunCreated = null,
         Action<string>? onQueueCreated = null,
-        JobRunActivationGate? activationGate = null)
+        JobRunActivationGate? activationGate = null,
+        long? expectedGeneration = null)
     {
         if (!job.IsEnabled)
         {
@@ -282,10 +331,14 @@ internal sealed partial class JobWorker
         onRunCreated?.Invoke(run);
         run.NotifyStateChange(JobStateType.Scheduled);
 
-        // Checked atomically with queue removal, so a job removed concurrently isn't brought back by a pending reschedule.
+        // Checked atomically with queue removal, so a job removed concurrently isn't brought back by a
+        // pending reschedule. The generation check additionally rejects follow-up runs of a stale lease
+        // after a remove/reschedule moved the queue to a newer generation.
         if (!jobQueueManager.Enqueue(
                 run,
-                () => registry.IsRootJob(job),
+                () => registry.IsRootJob(job)
+                    && (expectedGeneration is not long generation
+                        || jobQueueManager.IsCurrentGeneration(job.JobFullName, generation)),
                 onQueueCreated))
         {
             run.NotifyStateChange(JobStateType.Cancelled);
@@ -325,4 +378,10 @@ internal sealed partial class JobWorker
     }
 
     private static TaskCompletionSource CreateSignal() => new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+    /// <summary>
+    /// Capacity is accounted per queue generation, so a stale completion of an old generation can
+    /// never release a slot of a newer generation.
+    /// </summary>
+    private readonly record struct SlotKey(string JobFullName, long Generation);
 }

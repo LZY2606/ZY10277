@@ -4,10 +4,26 @@ using System.Diagnostics.CodeAnalysis;
 
 namespace NCronJob;
 
+/// <summary>
+/// Owns the explicit queue state machine that converges enqueue, lease, dequeue, remove/reschedule
+/// and the wake-up signal. All transitions happen under <see cref="syncLock"/>; user code
+/// (job bodies, progress notifications) always runs outside the lock.
+/// <para>
+/// Per queue name the lifecycle is:
+/// <code>
+/// Absent --Enqueue--> Active(g) --Enqueue--> Active(g)     (item stamped with g, version++, signal fires)
+/// Active(g) --TryDequeue--> Active(g)                      (item Enqueued -> Leased, lease carries g)
+/// Active(g) --RemoveQueue--> Absent                        (signal fires, queued items -> Cancelled)
+/// Absent --Enqueue--> Active(g+1)                          (re-add/reschedule starts a new generation)
+/// </code>
+/// Generations come from a monotonically increasing counter, so a stale lease or completion of an
+/// old generation can never be confused with a re-created queue of the same name.
+/// </para>
+/// </summary>
 internal sealed class JobQueueManager : IDisposable
 {
-    private readonly ConcurrentDictionary<string, JobQueue> jobQueues = new();
-    private readonly Dictionary<string, TaskCompletionSource> queueSignals = [];
+    private readonly ConcurrentDictionary<string, QueueState> jobQueues = new();
+    private long nextGeneration;
 #if NET9_0_OR_GREATER
     private readonly Lock syncLock = new();
 #else
@@ -41,16 +57,17 @@ internal sealed class JobQueueManager : IDisposable
                 return false;
             }
 
-            var jobQueue = jobQueues.GetOrAdd(queueName, jt =>
+            var state = jobQueues.GetOrAdd(queueName, jt =>
             {
                 isCreating = true;
                 var queue = new JobQueue(jt);
                 queue.CollectionChanged += CallCollectionChanged;
-                queueSignals[jt] = CreateSignal();
-                return queue;
+                return new QueueState(queue, NextGenerationUnsafe());
             });
 
-            jobQueue.EnqueueForDirectExecution(run);
+            state.Queue.EnqueueForDirectExecution(run);
+            run.Generation = state.Generation;
+            AdvanceVersionUnsafe(state);
         }
 
         if (isCreating)
@@ -70,20 +87,16 @@ internal sealed class JobQueueManager : IDisposable
         {
             ObjectDisposedException.ThrowIf(IsDisposed, this);
 
-            if (!jobQueues.TryRemove(queueName, out var jobQueue))
+            if (!jobQueues.TryRemove(queueName, out var state))
             {
                 return;
             }
 
-            cancellableRuns = jobQueue.Where(j => j.IsCancellable).ToList();
+            cancellableRuns = state.Queue.Where(j => j.IsCancellable).ToList();
 
-            jobQueue.Clear();
-            jobQueue.CollectionChanged -= CallCollectionChanged;
-
-            if (queueSignals.Remove(queueName, out var signal))
-            {
-                signal.TrySetResult();
-            }
+            state.Queue.Clear();
+            state.Queue.CollectionChanged -= CallCollectionChanged;
+            CompleteSignalUnsafe(state);
         }
 
         // Progress callbacks run user code, so they must not be invoked while holding the lock.
@@ -106,44 +119,33 @@ internal sealed class JobQueueManager : IDisposable
         var createdQueueSet = createdQueueNames is null
             ? []
             : new HashSet<string>(createdQueueNames, StringComparer.Ordinal);
-        var signals = new List<TaskCompletionSource>();
 
         lock (syncLock)
         {
             if (!IsDisposed)
             {
-                foreach (var (queueName, jobQueue) in jobQueues.ToArray())
+                foreach (var (queueName, state) in jobQueues.ToArray())
                 {
-                    var removedRuns = jobQueue.RemoveWhere(runSet.Contains);
-                    var removeEmptyCreatedQueue = createdQueueSet.Contains(queueName) && jobQueue.Count == 0;
+                    var removedRuns = state.Queue.RemoveWhere(runSet.Contains);
+                    var removeEmptyCreatedQueue = createdQueueSet.Contains(queueName) && state.Queue.Count == 0;
 
                     if (removedRuns.Count == 0 && !removeEmptyCreatedQueue)
                     {
                         continue;
                     }
 
-                    if (jobQueue.Count == 0)
+                    if (state.Queue.Count == 0)
                     {
                         jobQueues.TryRemove(queueName, out _);
-                        jobQueue.CollectionChanged -= CallCollectionChanged;
-
-                        if (queueSignals.Remove(queueName, out var removedSignal))
-                        {
-                            signals.Add(removedSignal);
-                        }
+                        state.Queue.CollectionChanged -= CallCollectionChanged;
+                        CompleteSignalUnsafe(state);
                     }
-                    else if (queueSignals.TryGetValue(queueName, out var changedSignal))
+                    else
                     {
-                        queueSignals[queueName] = CreateSignal();
-                        signals.Add(changedSignal);
+                        AdvanceVersionUnsafe(state);
                     }
                 }
             }
-        }
-
-        foreach (var signal in signals)
-        {
-            signal.TrySetResult();
         }
 
         foreach (var run in runs.Where(run => run.IsCancellable))
@@ -155,7 +157,14 @@ internal sealed class JobQueueManager : IDisposable
     public bool TryGetQueue(string queueName, [MaybeNullWhen(false)] out JobQueue jobQueue)
     {
         ObjectDisposedException.ThrowIf(IsDisposed, this);
-        return jobQueues.TryGetValue(queueName, out jobQueue);
+        if (jobQueues.TryGetValue(queueName, out var state))
+        {
+            jobQueue = state.Queue;
+            return true;
+        }
+
+        jobQueue = null;
+        return false;
     }
 
     public IEnumerable<string> GetAllJobQueueNames()
@@ -165,17 +174,59 @@ internal sealed class JobQueueManager : IDisposable
     }
 
     /// <summary>
-    /// Returns a task that completes the next time the given queue changes or is removed.
-    /// Obtain it before inspecting the queue so that no change can be missed.
+    /// Captures an atomic snapshot of the given queue: the queue, its generation and the signal
+    /// that fires on the next transition. Returns <c>null</c> when the queue does not exist.
     /// </summary>
-    public Task WaitForChangeAsync(string queueName)
+    public QueueSnapshot? GetQueueSnapshot(string queueName)
     {
-        ObjectDisposedException.ThrowIf(IsDisposed, this);
         lock (syncLock)
         {
-            return queueSignals.TryGetValue(queueName, out var signal) ? signal.Task : Task.CompletedTask;
+            ObjectDisposedException.ThrowIf(IsDisposed, this);
+
+            return jobQueues.TryGetValue(queueName, out var state)
+                ? new QueueSnapshot(queueName, state.Queue, state.Generation, state.Version, state.ChangeSignal.Task)
+                : null;
         }
     }
+
+    /// <summary>
+    /// Transitions the head of the snapshotted queue from <c>Enqueued</c> to <c>Leased</c>, but only
+    /// when the queue is still at the snapshot's generation. A stale snapshot can never lease an item
+    /// of a newer generation.
+    /// </summary>
+    public bool TryDequeue(QueueSnapshot snapshot, JobRun expected, out JobLease lease)
+    {
+        ArgumentNullException.ThrowIfNull(snapshot);
+
+        lock (syncLock)
+        {
+            ObjectDisposedException.ThrowIf(IsDisposed, this);
+
+            if (!jobQueues.TryGetValue(snapshot.QueueName, out var state)
+                || state.Generation != snapshot.Generation
+                || !state.Queue.TryDequeueIf(expected))
+            {
+                lease = default;
+                return false;
+            }
+
+            lease = new JobLease(expected, state.Generation);
+            return true;
+        }
+    }
+
+    /// <summary>
+    /// Returns <c>true</c> when the queue currently exists and is still at <paramref name="generation"/>.
+    /// Used to reject stale completions and stale reschedules of a previous generation.
+    /// </summary>
+    public bool IsCurrentGeneration(string queueName, long generation) =>
+        jobQueues.TryGetValue(queueName, out var state) && state.Generation == generation;
+
+    /// <summary>
+    /// The current generation of the given queue, or <c>null</c> when the queue does not exist.
+    /// </summary>
+    internal long? GetCurrentGeneration(string queueName) =>
+        jobQueues.TryGetValue(queueName, out var state) ? state.Generation : null;
 
     internal async Task WaitUntilEmptyAsync(string queueName, CancellationToken cancellationToken)
     {
@@ -201,12 +252,12 @@ internal sealed class JobQueueManager : IDisposable
                 {
                     ObjectDisposedException.ThrowIf(IsDisposed, this);
 
-                    if (!jobQueues.TryGetValue(queueName, out var queue) || queue.Count == 0)
+                    if (!jobQueues.TryGetValue(queueName, out var state) || state.Queue.Count == 0)
                     {
                         return;
                     }
 
-                    queueChanged = queueSignals[queueName].Task;
+                    queueChanged = state.ChangeSignal.Task;
                 }
 
                 await Task.WhenAny(dequeued.Task, queueChanged)
@@ -227,46 +278,59 @@ internal sealed class JobQueueManager : IDisposable
 
         lock (syncLock)
         {
-            foreach (var jobQueue in jobQueues.Values)
+            foreach (var state in jobQueues.Values)
             {
-                jobQueue.CollectionChanged -= CallCollectionChanged;
-            }
-
-            foreach (var signal in queueSignals.Values)
-            {
-                signal.TrySetResult();
+                state.Queue.CollectionChanged -= CallCollectionChanged;
+                CompleteSignalUnsafe(state);
             }
 
             jobQueues.Clear();
-            queueSignals.Clear();
 
             IsDisposed = true;
         }
     }
 
-    private void SignalJobQueue(string queueName)
-    {
-        lock (syncLock)
-        {
-            if (!queueSignals.TryGetValue(queueName, out var signal))
-            {
-                return;
-            }
+    private long NextGenerationUnsafe() => ++nextGeneration;
 
-            queueSignals[queueName] = CreateSignal();
-            signal.TrySetResult();
-        }
+    /// <summary>
+    /// Records an observable transition of the queue and completes the previous signal.
+    /// Because the swap and the completion happen under <see cref="syncLock"/>, any signal captured
+    /// before the transition is guaranteed to complete: no wake-up can be lost.
+    /// </summary>
+    private static void AdvanceVersionUnsafe(QueueState state)
+    {
+        var signal = state.ChangeSignal;
+        state.Version++;
+        state.ChangeSignal = CreateSignal();
+        signal.TrySetResult();
     }
+
+    /// <summary>
+    /// Completes the signal of a retired queue state without handing out a replacement:
+    /// the queue is gone, so every waiter must wake up and re-observe.
+    /// </summary>
+    private static void CompleteSignalUnsafe(QueueState state) => state.ChangeSignal.TrySetResult();
 
     private void CallCollectionChanged(object? sender, NotifyCollectionChangedEventArgs e)
     {
-        if (sender is JobQueue jobQueue && e.Action == NotifyCollectionChangedAction.Add)
-        {
-            SignalJobQueue(jobQueue.Name);
-        }
-
         CollectionChanged?.Invoke(sender, e);
     }
 
     private static TaskCompletionSource CreateSignal() => new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+    /// <summary>
+    /// The mutable state of one queue generation. A new instance (with a fresh, higher generation)
+    /// is created whenever a queue is re-added after removal, so generations of a re-created queue
+    /// never collide with stale leases.
+    /// </summary>
+    private sealed class QueueState(JobQueue queue, long generation)
+    {
+        public JobQueue Queue { get; } = queue;
+
+        public long Generation { get; } = generation;
+
+        public long Version { get; set; }
+
+        public TaskCompletionSource ChangeSignal { get; set; } = CreateSignal();
+    }
 }

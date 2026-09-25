@@ -5,6 +5,12 @@ namespace NCronJob;
 
 internal class JobRun
 {
+    /// <summary>
+    /// The generation assigned to runs that never pass through a queue (instant or startup runs).
+    /// Queue generations handed out by the <see cref="JobQueueManager"/> start at <c>1</c>.
+    /// </summary>
+    internal const long UngeneratedGeneration = 0;
+
     private readonly JobRun rootJob;
     private readonly TimeProvider timeProvider;
     private readonly ConcurrencySettings settings;
@@ -62,6 +68,13 @@ internal class JobRun
     }
 
     internal JobPriority Priority { get; set; } = JobPriority.Normal;
+
+    /// <summary>
+    /// The generation of the queue this run was enqueued into. A worker that leased this run may only
+    /// complete it (release capacity, schedule the follow-up run) against the same queue generation;
+    /// a stale generation must neither free slots of, nor reorder the next due run of, a newer generation.
+    /// </summary>
+    internal long Generation { get; set; } = UngeneratedGeneration;
 
     public Guid JobRunId { get; }
     public Guid? ParentJobRunId { get; }

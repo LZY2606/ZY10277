@@ -6,6 +6,10 @@ All notable changes to **NCronJob** will be documented in this file. The project
 
 ## [Unreleased]
 
+### Changed
+
+- The scheduler's enqueue/lease/complete/reschedule/signal logic is consolidated into an explicit, generation-based queue state machine. Every runtime job and queue item carries a generation; a worker may only complete items of the generation it leased them from, so a stale completion can neither release slots of a newer generation nor reorder its next due run after a concurrent remove/reschedule. Queue wake-ups use versioned signals captured atomically with the queue state, provably avoiding lost wake-ups.
+
 ## [v4.12.1] - 2026-09-17
 
 ### Fixed
